@@ -99,7 +99,14 @@ router.get('/payouts', async (_req, res) => {
   });
 });
 
-router.get('/health', (_req, res) => res.json({ ok: true }));
+router.get('/health', async (_req, res) => {
+  try {
+    await users().estimatedDocumentCount();
+    res.json({ ok: true, db: true });
+  } catch (e) {
+    res.status(500).json({ ok: false, db: false });
+  }
+});
 
 // ============ Authenticated ============
 router.use(authMiddleware);

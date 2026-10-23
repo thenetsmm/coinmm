@@ -41,7 +41,7 @@ bot.start(async (ctx) => {
 
   const member = await isChannelMember(u.id);
 
-  if (!member) {
+  if (!member && cfg.channelUrl) {
     return ctx.reply(
       `👋 မင်္ဂလာပါ ${u.first_name || ''}!\n\n` +
         `📢 သတင်းအချက်အလက်များ သိရှိနိုင်ရန် ကျွန်ုပ်တို့ channel ကို join ပေးပါ။\n\n` +
