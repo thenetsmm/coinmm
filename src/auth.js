@@ -1,6 +1,6 @@
 import crypto from 'crypto';
 import { cfg } from './config.js';
-import { q } from './db.js';
+import { upsertUser } from './db.js';
 
 // Telegram Mini App initData ကို HMAC နဲ့ စစ်ဆေးခြင်း
 export function verifyInitData(initData) {
@@ -31,17 +31,6 @@ export function verifyInitData(initData) {
   } catch {
     return null;
   }
-}
-
-export async function upsertUser(tgUser) {
-  const { rows } = await q(
-    `INSERT INTO users (id, username, first_name)
-     VALUES ($1,$2,$3)
-     ON CONFLICT (id) DO UPDATE SET username = EXCLUDED.username, first_name = EXCLUDED.first_name
-     RETURNING *`,
-    [tgUser.id, tgUser.username || null, tgUser.first_name || null]
-  );
-  return rows[0];
 }
 
 export async function authMiddleware(req, res, next) {

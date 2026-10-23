@@ -1,25 +1,14 @@
 import crypto from 'crypto';
 import { Router } from 'express';
+import { ObjectId } from 'mongodb';
 import { cfg, coinsToKyat, todayMM, yesterdayMM } from './config.js';
-import { q, tx, credit } from './db.js';
+import { users, adEvents, transactions, withdrawals, tx, credit, nextSeq } from './db.js';
 import { authMiddleware } from './auth.js';
 import { isChannelMember, maskName, notifyAdmins } from './bot.js';
 
 const router = Router();
 
-const USER_COLS = `id, username, first_name, balance, total_earned, ads_today,
-  to_char(ads_day,'YYYY-MM-DD') AS ads_day, last_ad_at, checkin_streak,
-  to_char(last_checkin,'YYYY-MM-DD') AS last_checkin,
-  to_char(last_spin,'YYYY-MM-DD') AS last_spin, channel_task_done, banned`;
-
-async function getUser(id, client = null, lock = false) {
-  const runner = client || { query: q };
-  const { rows } = await runner.query(
-    `SELECT ${USER_COLS} FROM users WHERE id=$1 ${lock ? 'FOR UPDATE' : ''}`,
-    [id]
-  );
-  return rows[0];
-}
+const getUser = (id, session = undefined) => users().findOne({ _id: id }, { session });
 
 const adsUsedToday = (u) => (u.ads_day === todayMM() ? u.ads_today : 0);
 const randInt = (min, max) => crypto.randomInt(min, max + 1);
@@ -27,7 +16,7 @@ const randInt = (min, max) => crypto.randomInt(min, max + 1);
 function publicUser(u) {
   const today = todayMM();
   return {
-    id: String(u.id),
+    id: String(u._id),
     firstName: u.first_name,
     balance: Number(u.balance),
     totalEarned: Number(u.total_earned),
@@ -70,13 +59,15 @@ router.get('/adsgram/reward', async (req, res) => {
     const userId = Number(req.query.userid);
     if (!userId) return res.status(400).json({ error: 'bad_userid' });
 
-    await q(
-      `UPDATE ad_events SET verified = TRUE WHERE id = (
-         SELECT id FROM ad_events
-         WHERE user_id=$1 AND verified=FALSE AND claimed=FALSE
-           AND created_at > now() - interval '10 minutes'
-         ORDER BY id DESC LIMIT 1)`,
-      [userId]
+    await adEvents().findOneAndUpdate(
+      {
+        user_id: userId,
+        verified: false,
+        claimed: false,
+        created_at: { $gt: new Date(Date.now() - 10 * 60 * 1000) },
+      },
+      { $set: { verified: true } },
+      { sort: { _id: -1 } }
     );
     res.json({ ok: true });
   } catch (e) {
@@ -87,15 +78,19 @@ router.get('/adsgram/reward', async (req, res) => {
 
 // ============ Public ============
 router.get('/payouts', async (_req, res) => {
-  const { rows } = await q(
-    `SELECT w.id, w.amount_mmk, w.method, w.processed_at, w.proof_note, u.first_name, u.id AS uid
-     FROM withdrawals w JOIN users u ON u.id=w.user_id
-     WHERE w.status='paid' ORDER BY w.processed_at DESC LIMIT 30`
-  );
+  const rows = await withdrawals()
+    .find({ status: 'paid' })
+    .sort({ processed_at: -1 })
+    .limit(30)
+    .toArray();
+  const us = await users()
+    .find({ _id: { $in: [...new Set(rows.map((r) => r.user_id))] } })
+    .toArray();
+  const byId = new Map(us.map((u) => [u._id, u]));
   res.json({
     payouts: rows.map((r) => ({
-      id: r.id,
-      name: maskName({ first_name: r.first_name, id: r.uid }),
+      id: r._id,
+      name: maskName({ first_name: byId.get(r.user_id)?.first_name, id: r.user_id }),
       amount: Number(r.amount_mmk),
       method: r.method,
       at: r.processed_at,
@@ -110,12 +105,12 @@ router.get('/health', (_req, res) => res.json({ ok: true }));
 router.use(authMiddleware);
 
 router.get('/me', async (req, res) => {
-  const u = await getUser(req.user.id);
+  const u = await getUser(req.user._id);
   res.json({ user: publicUser(u), config: publicConfig() });
 });
 
 router.post('/ad/start', async (req, res) => {
-  const u = await getUser(req.user.id);
+  const u = await getUser(req.user._id);
   if (adsUsedToday(u) >= cfg.maxAdsPerDay) return res.status(429).json({ error: 'daily_limit' });
   if (u.last_ad_at) {
     const waited = (Date.now() - new Date(u.last_ad_at).getTime()) / 1000;
@@ -125,20 +120,22 @@ router.post('/ad/start', async (req, res) => {
         .json({ error: 'cooldown', waitSec: Math.ceil(cfg.adCooldownSec - waited) });
     }
   }
-  const { rows } = await q('INSERT INTO ad_events (user_id) VALUES ($1) RETURNING id', [u.id]);
-  res.json({ eventId: String(rows[0].id), mode: cfg.rewardMode });
+  const r = await adEvents().insertOne({
+    user_id: u._id,
+    created_at: new Date(),
+    verified: false,
+    claimed: false,
+  });
+  res.json({ eventId: String(r.insertedId), mode: cfg.rewardMode });
 });
 
 router.post('/ad/claim', async (req, res) => {
-  const eventId = Number(req.body?.eventId);
-  if (!eventId) return res.status(400).json({ error: 'bad_request' });
+  const rawId = String(req.body?.eventId || '');
+  if (!ObjectId.isValid(rawId)) return res.status(400).json({ error: 'bad_request' });
+  const eventId = new ObjectId(rawId);
 
-  const result = await tx(async (c) => {
-    const { rows } = await c.query(
-      'SELECT * FROM ad_events WHERE id=$1 AND user_id=$2 FOR UPDATE',
-      [eventId, req.user.id]
-    );
-    const ev = rows[0];
+  const result = await tx(async (session) => {
+    const ev = await adEvents().findOne({ _id: eventId, user_id: req.user._id }, { session });
     if (!ev || ev.claimed) return { status: 404, body: { error: 'not_found' } };
 
     const ageMs = Date.now() - new Date(ev.created_at).getTime();
@@ -150,22 +147,37 @@ router.post('/ad/claim', async (req, res) => {
       return { status: 400, body: { error: 'too_fast' } };
     }
 
-    const u = await getUser(req.user.id, c, true);
+    const u = await getUser(req.user._id, session);
     if (adsUsedToday(u) >= cfg.maxAdsPerDay) {
       return { status: 429, body: { error: 'daily_limit' } };
     }
 
     const reward = cfg.rewardOptions[randInt(0, cfg.rewardOptions.length - 1)];
-    await c.query('UPDATE ad_events SET claimed=TRUE WHERE id=$1', [eventId]);
-    await c.query(
-      `UPDATE users SET
-         ads_today = CASE WHEN ads_day = $2::date THEN ads_today + 1 ELSE 1 END,
-         ads_day = $2::date, last_ad_at = now()
-       WHERE id=$1`,
-      [u.id, todayMM()]
+    const today = todayMM();
+    const claimed = await adEvents().updateOne(
+      { _id: eventId, claimed: false },
+      { $set: { claimed: true } },
+      { session }
     );
-    await credit(c, u.id, reward, 'ad', `event ${eventId}`);
-    const fresh = await getUser(u.id, c);
+    if (!claimed.modifiedCount) return { status: 404, body: { error: 'not_found' } };
+
+    await users().updateOne(
+      { _id: u._id },
+      [
+        {
+          $set: {
+            ads_today: {
+              $cond: [{ $eq: ['$ads_day', today] }, { $add: ['$ads_today', 1] }, 1],
+            },
+            ads_day: today,
+            last_ad_at: new Date(),
+          },
+        },
+      ],
+      { session }
+    );
+    await credit(session, u._id, reward, 'ad', `event ${rawId}`);
+    const fresh = await getUser(u._id, session);
     return { status: 200, body: { reward, user: publicUser(fresh) } };
   });
 
@@ -173,47 +185,50 @@ router.post('/ad/claim', async (req, res) => {
 });
 
 router.post('/checkin', async (req, res) => {
-  const out = await tx(async (c) => {
-    const u = await getUser(req.user.id, c, true);
+  const out = await tx(async (session) => {
+    const u = await getUser(req.user._id, session);
     const today = todayMM();
     if (u.last_checkin === today) return { status: 400, body: { error: 'already' } };
     const streak = u.last_checkin === yesterdayMM() ? u.checkin_streak + 1 : 1;
     const reward = cfg.checkinBase + Math.min(streak - 1, 6);
-    await c.query('UPDATE users SET checkin_streak=$2, last_checkin=$3::date WHERE id=$1', [
-      u.id,
-      streak,
-      today,
-    ]);
-    await credit(c, u.id, reward, 'checkin', `streak ${streak}`);
-    return { status: 200, body: { reward, streak, user: publicUser(await getUser(u.id, c)) } };
+    await users().updateOne(
+      { _id: u._id },
+      { $set: { checkin_streak: streak, last_checkin: today } },
+      { session }
+    );
+    await credit(session, u._id, reward, 'checkin', `streak ${streak}`);
+    return {
+      status: 200,
+      body: { reward, streak, user: publicUser(await getUser(u._id, session)) },
+    };
   });
   res.status(out.status).json(out.body);
 });
 
 router.post('/spin', async (req, res) => {
-  const out = await tx(async (c) => {
-    const u = await getUser(req.user.id, c, true);
+  const out = await tx(async (session) => {
+    const u = await getUser(req.user._id, session);
     const today = todayMM();
     if (u.last_spin === today) return { status: 400, body: { error: 'already' } };
     const reward = randInt(cfg.spinMin, cfg.spinMax);
-    await c.query('UPDATE users SET last_spin=$2::date WHERE id=$1', [u.id, today]);
-    await credit(c, u.id, reward, 'spin');
-    return { status: 200, body: { reward, user: publicUser(await getUser(u.id, c)) } };
+    await users().updateOne({ _id: u._id }, { $set: { last_spin: today } }, { session });
+    await credit(session, u._id, reward, 'spin');
+    return { status: 200, body: { reward, user: publicUser(await getUser(u._id, session)) } };
   });
   res.status(out.status).json(out.body);
 });
 
 router.post('/task/channel', async (req, res) => {
-  const member = await isChannelMember(req.user.id);
+  const member = await isChannelMember(req.user._id);
   if (!member) return res.status(400).json({ error: 'not_member' });
-  const out = await tx(async (c) => {
-    const u = await getUser(req.user.id, c, true);
+  const out = await tx(async (session) => {
+    const u = await getUser(req.user._id, session);
     if (u.channel_task_done) return { status: 400, body: { error: 'already' } };
-    await c.query('UPDATE users SET channel_task_done=TRUE WHERE id=$1', [u.id]);
-    await credit(c, u.id, cfg.channelTaskReward, 'task', 'channel');
+    await users().updateOne({ _id: u._id }, { $set: { channel_task_done: true } }, { session });
+    await credit(session, u._id, cfg.channelTaskReward, 'task', 'channel');
     return {
       status: 200,
-      body: { reward: cfg.channelTaskReward, user: publicUser(await getUser(u.id, c)) },
+      body: { reward: cfg.channelTaskReward, user: publicUser(await getUser(u._id, session)) },
     };
   });
   res.status(out.status).json(out.body);
@@ -229,46 +244,76 @@ router.post('/withdraw', async (req, res) => {
   if (!cfg.withdrawMethods.includes(method)) return res.status(400).json({ error: 'bad_method' });
   if (!/^[0-9+\s-]{7,20}$/.test(account)) return res.status(400).json({ error: 'bad_account' });
 
-  const out = await tx(async (c) => {
-    const u = await getUser(req.user.id, c, true);
-    if (Number(u.balance) < coins) return { status: 400, body: { error: 'insufficient' } };
-    const pend = await c.query(
-      `SELECT 1 FROM withdrawals WHERE user_id=$1 AND status='pending' LIMIT 1`,
-      [u.id]
-    );
-    if (pend.rowCount) return { status: 400, body: { error: 'pending_exists' } };
+  const wid = await nextSeq('withdrawals');
 
-    const mmk = coinsToKyat(coins);
-    await c.query('UPDATE users SET balance = balance - $2 WHERE id=$1', [u.id, coins]);
-    await c.query(
-      'INSERT INTO transactions (user_id, amount, type, note) VALUES ($1,$2,$3,$4)',
-      [u.id, -coins, 'withdraw', `${method} ${account}`]
-    );
-    const { rows } = await c.query(
-      `INSERT INTO withdrawals (user_id, coins, amount_mmk, method, account)
-       VALUES ($1,$2,$3,$4,$5) RETURNING id`,
-      [u.id, coins, mmk, method, account]
-    );
-    return {
-      status: 200,
-      body: { id: rows[0].id, amount: mmk, user: publicUser(await getUser(u.id, c)) },
-      notify: `💸 ငွေထုတ်တောင်းဆိုမှုအသစ် #${rows[0].id}\n👤 ${u.first_name || ''} @${u.username || '-'} (${u.id})\n${mmk} ကျပ် (${coins} coin)\n${method}: ${account}\n\n/paid ${rows[0].id} <ref>\n/reject ${rows[0].id} <reason>`,
-    };
-  });
+  let out;
+  try {
+    out = await tx(async (session) => {
+      const u = await getUser(req.user._id, session);
+      if (Number(u.balance) < coins) return { status: 400, body: { error: 'insufficient' } };
+      const pend = await withdrawals().findOne(
+        { user_id: u._id, status: 'pending' },
+        { session }
+      );
+      if (pend) return { status: 400, body: { error: 'pending_exists' } };
+
+      const mmk = coinsToKyat(coins);
+      const dec = await users().updateOne(
+        { _id: u._id, balance: { $gte: coins } },
+        { $inc: { balance: -coins } },
+        { session }
+      );
+      if (!dec.modifiedCount) return { status: 400, body: { error: 'insufficient' } };
+
+      await transactions().insertOne(
+        {
+          user_id: u._id,
+          amount: -coins,
+          type: 'withdraw',
+          note: `${method} ${account}`,
+          created_at: new Date(),
+        },
+        { session }
+      );
+      await withdrawals().insertOne(
+        {
+          _id: wid,
+          user_id: u._id,
+          coins,
+          amount_mmk: mmk,
+          method,
+          account,
+          status: 'pending',
+          proof_note: null,
+          created_at: new Date(),
+          processed_at: null,
+        },
+        { session }
+      );
+      return {
+        status: 200,
+        body: { id: wid, amount: mmk, user: publicUser(await getUser(u._id, session)) },
+        notify: `💸 ငွေထုတ်တောင်းဆိုမှုအသစ် #${wid}\n👤 ${u.first_name || ''} @${u.username || '-'} (${u._id})\n${mmk} ကျပ် (${coins} coin)\n${method}: ${account}\n\n/paid ${wid} <ref>\n/reject ${wid} <reason>`,
+      };
+    });
+  } catch (e) {
+    if (e?.code === 11000) return res.status(400).json({ error: 'pending_exists' });
+    throw e;
+  }
 
   if (out.notify) notifyAdmins(out.notify);
   res.status(out.status).json(out.body);
 });
 
 router.get('/withdrawals', async (req, res) => {
-  const { rows } = await q(
-    `SELECT id, coins, amount_mmk, method, status, proof_note, created_at, processed_at
-     FROM withdrawals WHERE user_id=$1 ORDER BY id DESC LIMIT 20`,
-    [req.user.id]
-  );
+  const rows = await withdrawals()
+    .find({ user_id: req.user._id })
+    .sort({ _id: -1 })
+    .limit(20)
+    .toArray();
   res.json({
     items: rows.map((r) => ({
-      id: r.id,
+      id: r._id,
       coins: Number(r.coins),
       amount: Number(r.amount_mmk),
       method: r.method,
@@ -280,16 +325,17 @@ router.get('/withdrawals', async (req, res) => {
 });
 
 router.get('/leaderboard', async (req, res) => {
-  const { rows } = await q(
-    `SELECT id, first_name, total_earned FROM users WHERE banned=FALSE
-     ORDER BY total_earned DESC LIMIT 10`
-  );
+  const rows = await users()
+    .find({ banned: false })
+    .sort({ total_earned: -1 })
+    .limit(10)
+    .toArray();
   res.json({
     top: rows.map((r, i) => ({
       rank: i + 1,
-      name: maskName(r),
+      name: maskName({ first_name: r.first_name, id: r._id }),
       coins: Number(r.total_earned),
-      me: String(r.id) === String(req.user.id),
+      me: String(r._id) === String(req.user._id),
     })),
   });
 });

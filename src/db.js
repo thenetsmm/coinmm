@@ -1,88 +1,103 @@
-import pg from 'pg';
+import { MongoClient } from 'mongodb';
 
-const useSsl = process.env.DATABASE_SSL !== 'false';
+const uri = process.env.MONGODB_URI;
+const dbName = process.env.MONGODB_DB || 'adcoin';
 
-export const pool = new pg.Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: useSsl ? { rejectUnauthorized: false } : false,
-  max: 8,
+export const client = new MongoClient(uri || 'mongodb://127.0.0.1:27017', {
+  maxPoolSize: 10,
+  serverSelectionTimeoutMS: 15000,
 });
 
-export const q = (text, params) => pool.query(text, params);
+let _db = null;
+export const db = () => {
+  if (!_db) throw new Error('DB not connected');
+  return _db;
+};
 
+// collection shortcuts
+export const users = () => db().collection('users');
+export const adEvents = () => db().collection('ad_events');
+export const transactions = () => db().collection('transactions');
+export const withdrawals = () => db().collection('withdrawals');
+const counters = () => db().collection('counters');
+
+export async function connect() {
+  await client.connect();
+  _db = client.db(dbName);
+  await createIndexes();
+}
+
+async function createIndexes() {
+  await adEvents().createIndex({ user_id: 1, _id: -1 });
+  // ad event မှတ်တမ်းကို ၁ ရက်ကြာလျှင် အလိုအလျောက် ဖျက်
+  await adEvents().createIndex({ created_at: 1 }, { expireAfterSeconds: 86400 });
+  await transactions().createIndex({ user_id: 1, _id: -1 });
+  await transactions().createIndex({ type: 1, created_at: -1 });
+  await withdrawals().createIndex({ status: 1, _id: 1 });
+  await withdrawals().createIndex({ user_id: 1, _id: -1 });
+  // user တစ်ယောက်ကို pending တစ်ခုထက်ပိုမရ (race condition ကာကွယ်)
+  await withdrawals().createIndex(
+    { user_id: 1 },
+    { unique: true, partialFilterExpression: { status: 'pending' }, name: 'one_pending_per_user' }
+  );
+  await users().createIndex({ banned: 1, total_earned: -1 });
+}
+
+// Transaction (Atlas / replica set လိုအပ်သည်။ conflict ဖြစ်လျှင် အလိုအလျောက် retry)
 export async function tx(fn) {
-  const client = await pool.connect();
+  const session = client.startSession();
   try {
-    await client.query('BEGIN');
-    const out = await fn(client);
-    await client.query('COMMIT');
-    return out;
-  } catch (e) {
-    await client.query('ROLLBACK').catch(() => {});
-    throw e;
+    return await session.withTransaction(() => fn(session), {
+      readConcern: { level: 'snapshot' },
+      writeConcern: { w: 'majority' },
+    });
   } finally {
-    client.release();
+    await session.endSession();
   }
 }
 
-export async function migrate() {
-  await q(`
-    CREATE TABLE IF NOT EXISTS users (
-      id BIGINT PRIMARY KEY,
-      username TEXT,
-      first_name TEXT,
-      balance BIGINT NOT NULL DEFAULT 0,
-      total_earned BIGINT NOT NULL DEFAULT 0,
-      ads_today INT NOT NULL DEFAULT 0,
-      ads_day DATE,
-      last_ad_at TIMESTAMPTZ,
-      checkin_streak INT NOT NULL DEFAULT 0,
-      last_checkin DATE,
-      last_spin DATE,
-      channel_task_done BOOLEAN NOT NULL DEFAULT FALSE,
-      banned BOOLEAN NOT NULL DEFAULT FALSE,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
-    CREATE TABLE IF NOT EXISTS ad_events (
-      id BIGSERIAL PRIMARY KEY,
-      user_id BIGINT NOT NULL REFERENCES users(id),
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      verified BOOLEAN NOT NULL DEFAULT FALSE,
-      claimed BOOLEAN NOT NULL DEFAULT FALSE
-    );
-    CREATE INDEX IF NOT EXISTS idx_ad_events_user ON ad_events(user_id, id DESC);
-    CREATE TABLE IF NOT EXISTS transactions (
-      id BIGSERIAL PRIMARY KEY,
-      user_id BIGINT NOT NULL REFERENCES users(id),
-      amount BIGINT NOT NULL,
-      type TEXT NOT NULL,
-      note TEXT,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
-    CREATE TABLE IF NOT EXISTS withdrawals (
-      id BIGSERIAL PRIMARY KEY,
-      user_id BIGINT NOT NULL REFERENCES users(id),
-      coins BIGINT NOT NULL,
-      amount_mmk BIGINT NOT NULL,
-      method TEXT NOT NULL,
-      account TEXT NOT NULL,
-      status TEXT NOT NULL DEFAULT 'pending',
-      proof_note TEXT,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      processed_at TIMESTAMPTZ
-    );
-    CREATE INDEX IF NOT EXISTS idx_withdrawals_status ON withdrawals(status, id);
-  `);
+// ငွေထုတ်တောင်းဆိုမှု #id အတွက် အစဉ်လိုက်ဂဏန်း
+export async function nextSeq(name) {
+  const doc = await counters().findOneAndUpdate(
+    { _id: name },
+    { $inc: { seq: 1 } },
+    { upsert: true, returnDocument: 'after' }
+  );
+  return doc.seq;
 }
 
-// transaction client ထဲမှာ coin ပေါင်းထည့်ပြီး ledger မှတ်
-export async function credit(client, userId, amount, type, note = null) {
-  await client.query(
-    'UPDATE users SET balance = balance + $2, total_earned = total_earned + $2 WHERE id = $1',
-    [userId, amount]
+export async function upsertUser(tgUser) {
+  return users().findOneAndUpdate(
+    { _id: tgUser.id },
+    {
+      $set: { username: tgUser.username || null, first_name: tgUser.first_name || null },
+      $setOnInsert: {
+        balance: 0,
+        total_earned: 0,
+        ads_today: 0,
+        ads_day: null,
+        last_ad_at: null,
+        checkin_streak: 0,
+        last_checkin: null,
+        last_spin: null,
+        channel_task_done: false,
+        banned: false,
+        created_at: new Date(),
+      },
+    },
+    { upsert: true, returnDocument: 'after' }
   );
-  await client.query(
-    'INSERT INTO transactions (user_id, amount, type, note) VALUES ($1,$2,$3,$4)',
-    [userId, amount, type, note]
+}
+
+// coin ပေါင်းထည့်ပြီး ledger မှတ် (session = transaction session)
+export async function credit(session, userId, amount, type, note = null) {
+  await users().updateOne(
+    { _id: userId },
+    { $inc: { balance: amount, total_earned: amount } },
+    { session }
+  );
+  await transactions().insertOne(
+    { user_id: userId, amount, type, note, created_at: new Date() },
+    { session }
   );
 }

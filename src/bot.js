@@ -1,6 +1,6 @@
 import { Telegraf, Markup } from 'telegraf';
 import { cfg, coinsToKyat } from './config.js';
-import { q, tx } from './db.js';
+import { users, transactions, withdrawals, tx, upsertUser } from './db.js';
 
 export const bot = new Telegraf(cfg.botToken || 'missing-token');
 
@@ -37,11 +37,7 @@ export async function notifyAdmins(text) {
 // ---------- /start ----------
 bot.start(async (ctx) => {
   const u = ctx.from;
-  await q(
-    `INSERT INTO users (id, username, first_name) VALUES ($1,$2,$3)
-     ON CONFLICT (id) DO UPDATE SET username = EXCLUDED.username, first_name = EXCLUDED.first_name`,
-    [u.id, u.username || null, u.first_name || null]
-  );
+  await upsertUser(u);
 
   const member = await isChannelMember(u.id);
 
@@ -68,17 +64,20 @@ bot.help((ctx) =>
 // ---------- Admin commands ----------
 bot.command('pending', async (ctx) => {
   if (!isAdmin(ctx.from.id)) return;
-  const { rows } = await q(
-    `SELECT w.*, u.first_name, u.username FROM withdrawals w
-     JOIN users u ON u.id = w.user_id WHERE w.status='pending' ORDER BY w.id LIMIT 30`
-  );
+  const rows = await withdrawals().find({ status: 'pending' }).sort({ _id: 1 }).limit(30).toArray();
   if (!rows.length) return ctx.reply('စောင့်ဆိုင်းနေသော ငွေထုတ်တောင်းဆိုမှု မရှိပါ ✅');
+  const us = await users()
+    .find({ _id: { $in: rows.map((r) => r.user_id) } })
+    .toArray();
+  const byId = new Map(us.map((u) => [u._id, u]));
   const text = rows
-    .map(
-      (w) =>
-        `#${w.id} | ${w.first_name || ''} @${w.username || '-'} (${w.user_id})\n` +
+    .map((w) => {
+      const u = byId.get(w.user_id) || {};
+      return (
+        `#${w._id} | ${u.first_name || ''} @${u.username || '-'} (${w.user_id})\n` +
         `${w.amount_mmk} ကျပ် (${w.coins} coin) | ${w.method}: ${w.account}`
-    )
+      );
+    })
     .join('\n\n');
   return ctx.reply(text + '\n\n/paid <id> <ငွေလွှဲအမှတ်>\n/reject <id> <အကြောင်းရင်း>');
 });
@@ -90,23 +89,19 @@ bot.command('paid', async (ctx) => {
   if (!id) return ctx.reply('အသုံးပြုပုံ: /paid <id> <ငွေလွှဲအမှတ်/မှတ်ချက်>');
   const note = rest.join(' ').trim() || null;
 
-  const w = await tx(async (c) => {
-    const { rows } = await c.query(
-      `UPDATE withdrawals SET status='paid', processed_at=now(), proof_note=$2
-       WHERE id=$1 AND status='pending' RETURNING *`,
-      [id, note]
-    );
-    return rows[0];
-  });
+  const w = await withdrawals().findOneAndUpdate(
+    { _id: id, status: 'pending' },
+    { $set: { status: 'paid', processed_at: new Date(), proof_note: note } },
+    { returnDocument: 'after' }
+  );
   if (!w) return ctx.reply('ရှာမတွေ့ပါ သို့မဟုတ် ပြီးပြီးသား ဖြစ်ပါသည်။');
 
-  const { rows } = await q('SELECT * FROM users WHERE id=$1', [w.user_id]);
-  const user = rows[0];
+  const user = (await users().findOne({ _id: w.user_id })) || {};
 
   bot.telegram
     .sendMessage(
       w.user_id,
-      `✅ သင့် ငွေထုတ်တောင်းဆိုမှု #${w.id} အောင်မြင်ပါသည်။\n💰 ${w.amount_mmk} ကျပ် → ${w.method}`
+      `✅ သင့် ငွေထုတ်တောင်းဆိုမှု #${w._id} အောင်မြင်ပါသည်။\n💰 ${w.amount_mmk} ကျပ် → ${w.method}`
     )
     .catch(() => {});
 
@@ -115,11 +110,11 @@ bot.command('paid', async (ctx) => {
     bot.telegram
       .sendMessage(
         cfg.proofChannelId,
-        `✅ ငွေထုတ်ပြီး\n👤 ${maskName(user)}\n💰 ${w.amount_mmk} ကျပ်\n🏦 ${w.method}${last4}\n🆔 #${w.id}`
+        `✅ ငွေထုတ်ပြီး\n👤 ${maskName({ first_name: user.first_name, id: w.user_id })}\n💰 ${w.amount_mmk} ကျပ်\n🏦 ${w.method}${last4}\n🆔 #${w._id}`
       )
       .catch((e) => console.error('proof post failed', e.message));
   }
-  return ctx.reply(`#${w.id} ကို paid အဖြစ် မှတ်ပြီးပါပြီ ✅`);
+  return ctx.reply(`#${w._id} ကို paid အဖြစ် မှတ်ပြီးပါပြီ ✅`);
 });
 
 bot.command('reject', async (ctx) => {
@@ -129,19 +124,24 @@ bot.command('reject', async (ctx) => {
   if (!id) return ctx.reply('အသုံးပြုပုံ: /reject <id> <အကြောင်းရင်း>');
   const reason = rest.join(' ').trim() || 'အကြောင်းမသိ';
 
-  const w = await tx(async (c) => {
-    const { rows } = await c.query(
-      `UPDATE withdrawals SET status='rejected', processed_at=now(), proof_note=$2
-       WHERE id=$1 AND status='pending' RETURNING *`,
-      [id, reason]
+  const w = await tx(async (session) => {
+    const row = await withdrawals().findOneAndUpdate(
+      { _id: id, status: 'pending' },
+      { $set: { status: 'rejected', processed_at: new Date(), proof_note: reason } },
+      { returnDocument: 'after', session }
     );
-    const row = rows[0];
     if (!row) return null;
     // coin ပြန်အမ်း (total_earned မတိုးစေရ)
-    await c.query('UPDATE users SET balance = balance + $2 WHERE id=$1', [row.user_id, row.coins]);
-    await c.query(
-      'INSERT INTO transactions (user_id, amount, type, note) VALUES ($1,$2,$3,$4)',
-      [row.user_id, row.coins, 'refund', `withdraw #${row.id} rejected`]
+    await users().updateOne({ _id: row.user_id }, { $inc: { balance: row.coins } }, { session });
+    await transactions().insertOne(
+      {
+        user_id: row.user_id,
+        amount: row.coins,
+        type: 'refund',
+        note: `withdraw #${row._id} rejected`,
+        created_at: new Date(),
+      },
+      { session }
     );
     return row;
   });
@@ -150,26 +150,28 @@ bot.command('reject', async (ctx) => {
   bot.telegram
     .sendMessage(
       w.user_id,
-      `❌ သင့် ငွေထုတ်တောင်းဆိုမှု #${w.id} ကို ငြင်းပယ်လိုက်ပါသည်။\nအကြောင်းရင်း: ${reason}\n🪙 coin ${w.coins} ကို ပြန်အမ်းပေးပြီးပါပြီ။`
+      `❌ သင့် ငွေထုတ်တောင်းဆိုမှု #${w._id} ကို ငြင်းပယ်လိုက်ပါသည်။\nအကြောင်းရင်း: ${reason}\n🪙 coin ${w.coins} ကို ပြန်အမ်းပေးပြီးပါပြီ။`
     )
     .catch(() => {});
-  return ctx.reply(`#${w.id} ကို ငြင်းပယ်ပြီး coin ပြန်အမ်းပြီးပါပြီ ✅`);
+  return ctx.reply(`#${w._id} ကို ငြင်းပယ်ပြီး coin ပြန်အမ်းပြီးပါပြီ ✅`);
 });
 
 bot.command('stats', async (ctx) => {
   if (!isAdmin(ctx.from.id)) return;
-  const { rows } = await q(
-    `SELECT
-       (SELECT count(*) FROM users) AS users,
-       (SELECT coalesce(sum(balance),0) FROM users) AS owed_coins,
-       (SELECT count(*) FROM withdrawals WHERE status='pending') AS pending,
-       (SELECT coalesce(sum(amount_mmk),0) FROM withdrawals WHERE status='paid') AS paid_mmk,
-       (SELECT count(*) FROM transactions WHERE type='ad' AND created_at > now() - interval '24 hours') AS ads_24h`
-  );
-  const s = rows[0];
+  const since = new Date(Date.now() - 24 * 3600 * 1000);
+  const [userCount, owed, pending, paid, ads24] = await Promise.all([
+    users().countDocuments({}),
+    users().aggregate([{ $group: { _id: null, t: { $sum: '$balance' } } }]).toArray(),
+    withdrawals().countDocuments({ status: 'pending' }),
+    withdrawals()
+      .aggregate([{ $match: { status: 'paid' } }, { $group: { _id: null, t: { $sum: '$amount_mmk' } } }])
+      .toArray(),
+    transactions().countDocuments({ type: 'ad', created_at: { $gt: since } }),
+  ]);
+  const owedCoins = owed[0]?.t || 0;
   return ctx.reply(
-    `👥 users: ${s.users}\n🪙 user များ လက်ကျန် coin: ${s.owed_coins} (≈ ${coinsToKyat(Number(s.owed_coins))} ကျပ်)\n` +
-      `⏳ pending: ${s.pending}\n💸 ပေးချေပြီး: ${s.paid_mmk} ကျပ်\n📺 ၂၄ နာရီအတွင်း ကြော်ငြာ: ${s.ads_24h}`
+    `👥 users: ${userCount}\n🪙 user များ လက်ကျန် coin: ${owedCoins} (≈ ${coinsToKyat(Number(owedCoins))} ကျပ်)\n` +
+      `⏳ pending: ${pending}\n💸 ပေးချေပြီး: ${paid[0]?.t || 0} ကျပ်\n📺 ၂၄ နာရီအတွင်း ကြော်ငြာ: ${ads24}`
   );
 });
 
@@ -177,7 +179,7 @@ bot.command('ban', async (ctx) => {
   if (!isAdmin(ctx.from.id)) return;
   const id = Number(ctx.message.text.split(' ')[1]);
   if (!id) return ctx.reply('/ban <user_id>');
-  await q('UPDATE users SET banned = TRUE WHERE id=$1', [id]);
+  await users().updateOne({ _id: id }, { $set: { banned: true } });
   return ctx.reply(`${id} ကို ban လိုက်ပါပြီ`);
 });
 
@@ -185,7 +187,7 @@ bot.command('unban', async (ctx) => {
   if (!isAdmin(ctx.from.id)) return;
   const id = Number(ctx.message.text.split(' ')[1]);
   if (!id) return ctx.reply('/unban <user_id>');
-  await q('UPDATE users SET banned = FALSE WHERE id=$1', [id]);
+  await users().updateOne({ _id: id }, { $set: { banned: false } });
   return ctx.reply(`${id} ကို ban ပြန်ဖြေလိုက်ပါပြီ`);
 });
 

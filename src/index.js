@@ -3,11 +3,11 @@ import express from 'express';
 import cors from 'cors';
 import rateLimit from 'express-rate-limit';
 import { cfg } from './config.js';
-import { migrate } from './db.js';
+import { connect } from './db.js';
 import { bot } from './bot.js';
 import router from './routes.js';
 
-const required = ['BOT_TOKEN', 'DATABASE_URL', 'WEBAPP_URL'];
+const required = ['BOT_TOKEN', 'MONGODB_URI', 'WEBAPP_URL'];
 const missing = required.filter((k) => !process.env[k]);
 if (missing.length) {
   console.error('Environment variable မပြည့်စုံပါ:', missing.join(', '));
@@ -40,7 +40,7 @@ app.use((err, _req, res, _next) => {
 });
 
 async function main() {
-  await migrate();
+  await connect();
   console.log('DB ready');
 
   await bot.telegram.setMyCommands([{ command: 'start', description: 'Mini App ဖွင့်ရန်' }]);
