@@ -28,7 +28,7 @@ app.get('/', (_req, res) => res.send('AdCoin MM backend is running'));
 
 // Telegram webhook
 const hookPath = `/telegram/${cfg.webhookSecret}`;
-app.use(hookPath, bot.webhookCallback(hookPath));
+app.use(bot.webhookCallback(hookPath));
 
 app.use('/api', rateLimit({ windowMs: 60_000, limit: 120, standardHeaders: true, legacyHeaders: false }));
 app.use('/api', router);
