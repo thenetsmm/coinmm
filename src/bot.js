@@ -39,26 +39,20 @@ bot.start(async (ctx) => {
   const u = ctx.from;
   await upsertUser(u);
 
-  const member = await isChannelMember(u.id);
+  // Mini App is ALWAYS reachable (channel join is optional) so Adsgram moderators can open it and see the ad placement.
+  const my = String(u.language_code || '').toLowerCase().startsWith('my');
+  const rows = [[Markup.button.webApp(my ? '🎮 Mini App ဖွင့်မည်' : '🎮 Open Mini App', cfg.webappUrl)]];
+  if (cfg.channelUrl) rows.push([Markup.button.url(my ? '📢 Channel Join မည်' : '📢 Join our channel', cfg.channelUrl)]);
 
-  if (!member && cfg.channelUrl) {
-    return ctx.reply(
-      `👋 မင်္ဂလာပါ ${u.first_name || ''}!\n\n` +
-        `📢 သတင်းအချက်အလက်များ သိရှိနိုင်ရန် ကျွန်ုပ်တို့ channel ကို join ပေးပါ။\n\n` +
-        `Join ပြီးပါက /start ကို ထပ်မံနှိပ်ပါ။`,
-      Markup.inlineKeyboard([[Markup.button.url('📢 Channel Join မည်', cfg.channelUrl)]])
-    );
-  }
+  const text = my
+    ? `👋 မင်္ဂလာပါ ${u.first_name || ''}!\n\n🎮 Mini App ထဲဝင်ပြီး ပင်မစာမျက်နှာရှိ "ကြော်ငြာကြည့်မည်" ခလုတ်ဖြင့် ကြော်ငြာကြည့်၍ coin ရယူနိုင်ပါသည်။\n\n📢 Channel join ခြင်းမှာ ရွေးချယ်ခွင့်သာ ဖြစ်ပြီး (task ဖြင့် bonus coin ရနိုင်)။`
+    : `👋 Hello ${u.first_name || ''}!\n\n🎮 Open the Mini App and tap the "Watch ad" button on the Home screen to watch a rewarded video ad and earn coin.\n\n📢 Joining our channel is optional (you can get a bonus coin task reward).`;
 
-  return ctx.reply(
-    `✅ ကျေးဇူးတင်ပါတယ် ${u.first_name || ''}!\n\n` +
-      `🎮 အောက်ပါခလုတ်ကို နှိပ်ပြီး Mini App ထဲဝင်ကာ ကြော်ငြာကြည့်၍ coin ရယူနိုင်ပါပြီ။`,
-    Markup.inlineKeyboard([[Markup.button.webApp('🎮 Mini App ဖွင့်မည်', cfg.webappUrl)]])
-  );
+  return ctx.reply(text, Markup.inlineKeyboard(rows));
 });
 
 bot.help((ctx) =>
-  ctx.reply('/start - Mini App ဖွင့်ရန်\n\nမေးစရာရှိပါက channel တွင် ဆက်သွယ်နိုင်ပါသည်။')
+  ctx.reply('/start - Open the Mini App / Mini App ဖွင့်ရန်')
 );
 
 // ---------- Admin commands ----------
