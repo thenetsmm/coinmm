@@ -30,6 +30,12 @@ function publicUser(u) {
   };
 }
 
+function proofUrl() {
+  const id = cfg.proofChannelId || '';
+  if (/^@[A-Za-z0-9_]{4,}$/.test(id)) return `https://t.me/${id.slice(1)}`;
+  return process.env.PROOF_CHANNEL_URL || '';
+}
+
 function publicConfig() {
   return {
     rewardOptions: cfg.rewardOptions,
@@ -43,6 +49,7 @@ function publicConfig() {
     spinMax: cfg.spinMax,
     channelTaskReward: cfg.channelTaskReward,
     channelUrl: cfg.channelUrl,
+    proofUrl: proofUrl(),
   };
 }
 
